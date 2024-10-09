@@ -3,7 +3,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from textwrap import dedent
 from typing import Optional
 
 from flytekit import task
@@ -13,6 +12,7 @@ from kubernetes.client.models import (
     V1SecurityContext,
 )
 from latch.executions import rename_current_execution
+from latch.functions.messages import message
 from latch.resources.tasks import (
     _get_large_gpu_pod,
     _get_small_gpu_pod,
@@ -20,7 +20,7 @@ from latch.resources.tasks import (
     small_gpu_task,
     v100_x1_task,
 )
-from latch.types.directory import LatchDir, LatchOutputDir
+from latch.types.directory import LatchOutputDir
 from latch.types.file import LatchFile
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -51,8 +51,15 @@ privileged_v100_x1_gpu_task = functools.partial(
 
 
 @privileged_v100_x1_gpu_task(cache=True)
-def task(
-    run_name: str, input_file: LatchFile, output_directory: LatchOutputDir
+def esmif_task(
+    run_name: str,
+    input_pdb: LatchFile,
+    output_directory: LatchOutputDir,
+    chain: Optional[str] = None,
+    temperature: float = 1.0,
+    num_samples: int = 1,
+    multichain_backbone: bool = False,
+    nogpu: bool = False,
 ) -> LatchOutputDir:
     rename_current_execution(str(run_name))
 
@@ -65,73 +72,120 @@ def task(
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(["nvcc", "--version"], check=True)
 
+    print("-" * 60)
     print("Mounting ObjectiveFS")
     ofs_p = Path("ofs").resolve()
     ofs_p.mkdir(parents=True, exist_ok=True)
 
-    # mount_command = [
-    #     "mount.objectivefs",
-    #     "-o",
-    #     "mtplus,noatime,nodiratime,noratelimit,freebw,hpc",
-    #     "s3://objectivefs-proteintools/rosettafoldaa",
-    #     str(ofs_p),
-    # ]
+    mount_command = [
+        "mount.objectivefs",
+        "-o",
+        "mtplus,noatime,nodiratime,noratelimit,freebw,hpc",
+        "s3://objectivefs-proteintools/esm",
+        str(ofs_p),
+    ]
 
-    # subprocess.run(mount_command, check=True)
+    subprocess.run(mount_command, check=True)
 
-    # # Wait for the mount to be established
-    # max_wait_time = 60  # Maximum wait time in seconds
-    # start_time = time.time()
-    # while time.time() - start_time < max_wait_time:
-    #     if any(ofs_p.iterdir()):
-    #         print("ObjectiveFS mounted successfully")
-    #         break
-    #     time.sleep(1)
-    # else:
-    #     print("Error: ObjectiveFS mount timed out")
-    #     sys.exit(1)
+    max_wait_time = 15
+    start_time = time.time()
+    while time.time() - start_time < max_wait_time:
+        if any(ofs_p.iterdir()):
+            print("ObjectiveFS mounted successfully")
+            break
+        time.sleep(1)
+    else:
+        print("Error: ObjectiveFS mount timed out")
+        message("error", {"title": "ObjectiveFS Mount failed", "body": "Failed mount"})
+        sys.exit(1)
 
-    # subprocess.run(f"ls -l {ofs_p}", shell=True, check=True)
+    print("-" * 60)
+    print("Linking databases")
+    checkpoints_dir = Path("/root/.cache/torch/hub/")
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    symlinks = [("esm_models", "checkpoints")]
 
-    # print("Linking databases")
-    # openfold_dir = Path("/tmp/docker-build/work/openfold")
-    # symlinks = [
-    #     ("RFAA_weights/RFAA_paper_weights.pt", "RFAA_paper_weights.pt"),
-    #     ("UniRef30_2020_06", "UniRef30_2020_06"),
-    #     ("bfd", "bfd"),
-    #     ("pdb100_2021Mar03", "pdb100_2021Mar03"),
-    # ]
+    print("Creating symlinks...")
+    for source, target in symlinks:
+        source_path = ofs_p / source
+        target_path = checkpoints_dir / target
 
-    # print("Creating symlinks...")
-    # for source, target in symlinks:
-    #     source_path = ofs_p / source
-    #     target_path = openfold_dir / target
+        if not target_path.exists():
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.symlink_to(source_path)
+            print(f"  Created: {target_path} -> {source_path}")
 
-    #     if not target_path.exists():
-    #         target_path.parent.mkdir(parents=True, exist_ok=True)
-    #         target_path.symlink_to(source_path)
-    #         print(f"  Created: {target_path} -> {source_path}")
+    print("Symlink creation complete.")
 
-    # subprocess.run(f"ls {ofs_p}", shell=True, check=True)
-
-    # print("Symlink creation complete.")
-
-    # subprocess.run(f"ls -l {openfold_dir}", shell=True, check=True)
-
-    print("Running Evolutionary Scale Modeling")
+    print("-" * 60)
+    print("Running Evolutionary Scale Modeling (ESM) Inverse Folding")
     esm_dir = Path("/root/esm")
-    command = f"""
-        source /opt/conda/bin/activate esminverse && \
-        python examples/inverse_folding/sample_sequences.py examples/inverse_folding/data/5YH2.pdb --chain C --temperature 1 --num-samples 3 --outpath {local_output_dir}/sampled_sequences.fasta
-    """
+    outpath = local_output_dir / f"{run_name}.fasta"
+
+    command = [
+        "python",
+        "examples/inverse_folding/sample_sequences.py",
+        str(input_pdb.local_path),
+        "--outpath",
+        str(outpath),
+        "--temperature",
+        str(temperature),
+        "--num-samples",
+        str(num_samples),
+    ]
+
+    if chain:
+        command.extend(["--chain", chain])
+    if multichain_backbone:
+        command.append("--multichain-backbone")
+    else:
+        command.append("--singlechain-backbone")
+    if nogpu:
+        command.append("--nogpu")
+
+    print(f"Running prediction command: {' '.join(command)}")
 
     try:
-        subprocess.run(command, cwd=esm_dir, shell=True, executable="/bin/bash")
-        # subprocess.run(command, check=True, cwd=openfold_dir)
-
+        subprocess.run(command, cwd=esm_dir)
         print("Done")
-    except:
-        print("FAILED")
+    except Exception as e:
+        print("FAILED: Predicing sequences")
+        message("error", {"title": "ESMFold Inverse Folding failed", "body": f"{e}"})
+        time.sleep(6000)
+
+    print("-" * 60)
+    print("Scoring sequences")
+    score_outpath = local_output_dir / f"{run_name}_scores.csv"
+
+    score_command = [
+        "python",
+        "examples/inverse_folding/score_log_likelihoods.py",
+        str(input_pdb.local_path),
+        str(outpath),
+        "--outpath",
+        str(score_outpath),
+    ]
+
+    if chain:
+        score_command.extend(["--chain", chain])
+
+    if multichain_backbone:
+        score_command.append("--multichain-backbone")
+    else:
+        score_command.append("--singlechain-backbone")
+
+    print(f"Running scoring command: {' '.join(score_command)}")
+
+    try:
+        subprocess.run(
+            score_command,
+            cwd=esm_dir,
+            check=True,
+        )
+        print("Scoring sequences completed successfully")
+    except Exception as e:
+        print("FAILED: Scoring sequences")
+        message("error", {"title": "ESMFold Scoring failed", "body": f"{e}"})
         time.sleep(6000)
 
     print("Returning results")
