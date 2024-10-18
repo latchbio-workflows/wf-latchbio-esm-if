@@ -17,8 +17,6 @@ from latch.resources.tasks import (
     _get_large_gpu_pod,
     _get_small_gpu_pod,
     get_v100_x1_pod,
-    small_gpu_task,
-    v100_x1_task,
 )
 from latch.types.directory import LatchOutputDir
 from latch.types.file import LatchFile
@@ -50,7 +48,7 @@ privileged_v100_x1_gpu_task = functools.partial(
 )
 
 
-@privileged_v100_x1_gpu_task(cache=True)
+@privileged_small_gpu_task(cache=True)
 def esmif_task(
     run_name: str,
     input_pdb: LatchFile,
@@ -151,7 +149,7 @@ def esmif_task(
     except Exception as e:
         print("FAILED: Predicing sequences")
         message("error", {"title": "ESMFold Inverse Folding failed", "body": f"{e}"})
-        time.sleep(6000)
+        sys.exit(1)
 
     print("-" * 60)
     print("Scoring sequences")
@@ -186,7 +184,8 @@ def esmif_task(
     except Exception as e:
         print("FAILED: Scoring sequences")
         message("error", {"title": "ESMFold Scoring failed", "body": f"{e}"})
-        time.sleep(6000)
+        sys.exit(1)
 
+    print("-" * 60)
     print("Returning results")
     return LatchOutputDir(str("/root/outputs"), output_directory.remote_path)
